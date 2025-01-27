@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  deepseek_agent:
+    build: .
+    volumes:
+      - .:/app
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+    networks:
+      - god_from_heaven_HEAVEN
+
+networks:
+  god_from_heaven_HEAVEN:
+    external: true
