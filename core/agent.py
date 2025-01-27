@@ -48,6 +48,13 @@ class Agent:
         )
         return history_id
         
+    def inject_proxy_user_msg(self, message: str) -> str:
+        """Injects a message back to the AI as if from a user, allowing iterative tool usage."""
+        print(f"\n{Fore.CYAN}💉 Injecting message:{Style.RESET_ALL}")
+        print(f"{Fore.CYAN}{message}{Style.RESET_ALL}")
+        user_message = f"Here's the injection you requested: 💉\n{message}\n💉"
+        return self.chat(user_message)
+
     def chat(
         self,
         message: str,
@@ -115,11 +122,21 @@ class Agent:
                         
         print(f"\n{Fore.GREEN}💭 Response:{Style.RESET_ALL}\n{content}")
         
+        # Process the content for system actions as we receive it
+        current_content = ""
+        for line in content.split('\n'):
+            if '<sysAction>' in line:
+                # Process any system actions in this line
+                processed_line = self.process_system_actions(line)
+                current_content += processed_line + '\n' if processed_line else '\n'
+            else:
+                current_content += line + '\n'
+        
         # Update history
         self.histories[history_id].messages.append(Message(role="user", content=message))
-        self.histories[history_id].messages.append(Message(role="assistant", content=content))
+        self.histories[history_id].messages.append(Message(role="assistant", content=current_content))
         
-        return content
+        return current_content
     
     def process_system_actions(self, text: str) -> str:
         """Process any system actions in the text using regex"""
@@ -130,11 +147,29 @@ class Agent:
             if hasattr(self, func_name):
                 func = getattr(self, func_name)
                 try:
-                    result = func(func_args)
-                    return f"Action {func_name} executed: {result}"
+                    # Clean up the args string (remove quotes if present)
+                    clean_args = func_args.strip('"\'')
+                    result = func(clean_args)
+                    # Format result for injection
+                    if isinstance(result, str) and result.startswith("Error"):
+                        action_result = f"🚨<sysActionError>\n{func_name}({func_args})\n\n[RESULT]:\n\n{result}\n</sysActionError>🚨"
+                    else:
+                        action_result = f"<sysActionResults>\n{func_name}({func_args})\n\n[RESULT]:\n\n{result}\n</sysActionResults>"
+                    
+                    # Print debug info
+                    print(f"\n{Fore.YELLOW}Executing sysAction: {func_name}({clean_args}){Style.RESET_ALL}")
+                    print(f"{Fore.GREEN}Result: {result}{Style.RESET_ALL}")
+                    
+                    # Inject result back to AI and return empty string to hide original output
+                    self.inject_proxy_user_msg(action_result)
+                    return ""
                 except Exception as e:
-                    return f"Error executing {func_name}: {str(e)}"
-            return f"Unknown action: {func_name}"
+                    error_result = f"🚨<sysActionError>\n{func_name}({func_args})\n\n[ERROR]:\n\n{str(e)}\n</sysActionError>🚨"
+                    self.inject_proxy_user_msg(error_result)
+                    return ""
+            unknown_result = f"🚨<sysActionError>\nUnknown action: {func_name}\n</sysActionError>🚨"
+            self.inject_proxy_user_msg(unknown_result)
+            return ""
             
         return re.sub(
             r'<sysAction>\s*(\w+)\s*\((.*?)\)\s*</sysAction>',
