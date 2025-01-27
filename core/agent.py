@@ -17,29 +17,7 @@ class History(BaseModel):
     project: Optional[str] = None
     profile: Optional[str] = None
 
-TOOL_DOCS = """Available Tools:
-
-1. bash(command: str) -> str
-   Execute a bash command and return its output.
-   - command: The bash command to execute
-   Example: <sysAction>bash("ls -la")</sysAction>
-
-2. str_replace_editor(command: str, path: str, ...) -> str
-   Edit files with various commands:
-   - command: The action to perform (view/create/str_replace/insert/undo_edit)
-   - path: Full path to the file
-   Additional parameters based on command:
-   * view: view_range=[start,end] (optional)
-   * create: file_text=content
-   * str_replace: old_str=existing, new_str=replacement
-   * insert: insert_line=N, new_str=content
-   Example: <sysAction>str_replace_editor(command="view", path="/path/to/file")</sysAction>
-
-Important Notes:
-- For str_replace, old_str must match EXACTLY (watch whitespace!)
-- Make sure paths are absolute (start with /)
-- One tool action at a time, wait for results
-"""
+from .tools import load_tools
 
 class Agent:
     def __init__(
@@ -61,104 +39,10 @@ class Agent:
         self.current_history_id: Optional[str] = None
         self.current_profile: Optional[str] = None
         
-        # Set up the tools
-        import subprocess
-        import json
-        import os
-        from pathlib import Path
-        
-        def bash(self, command: str) -> str:
-            """Execute a bash command and return its output"""
-            try:
-                result = subprocess.run(command, shell=True, capture_output=True, text=True)
-                return result.stdout if result.returncode == 0 else f"Error: {result.stderr}"
-            except Exception as e:
-                return f"Error executing command: {str(e)}"
-                
-        def str_replace_editor(self, command_str: str) -> str:
-            """Execute editor commands with proper argument parsing"""
-            try:
-                # Parse the command string into a dict
-                import re
-                params = {}
-                # Extract named parameters (key="value" or key=value)
-                pattern = r'(\w+)=(?:"([^"]*?)"|([^,\s]*?)(?=\s*(?:\w+=|$)))'
-                matches = re.finditer(pattern, command_str)
-                for match in matches:
-                    key = match.group(1)
-                    value = match.group(2) if match.group(2) is not None else match.group(3)
-                    params[key] = value
-                
-                if "command" not in params:
-                    return "Error: command parameter is required"
-                    
-                if params["command"] == "view":
-                    if "path" not in params:
-                        return "Error: path parameter is required"
-                    path = Path(params["path"])
-                    if not path.exists():
-                        return f"Error: {path} does not exist"
-                    if path.is_file():
-                        content = path.read_text()
-                        if "view_range" in params:
-                            try:
-                                range_list = json.loads(params["view_range"])
-                                lines = content.splitlines()
-                                content = "\n".join(lines[range_list[0]-1:range_list[1]])
-                            except:
-                                return "Error: Invalid view_range format"
-                        return content
-                    else:
-                        return "\n".join(str(p) for p in path.glob("**/*") if not p.name.startswith("."))
-                        
-                elif params["command"] == "create":
-                    if "path" not in params or "file_text" not in params:
-                        return "Error: path and file_text parameters are required"
-                    path = Path(params["path"])
-                    if path.exists():
-                        return f"Error: {path} already exists"
-                    path.write_text(params["file_text"])
-                    return f"Created {path}"
-                    
-                elif params["command"] == "str_replace":
-                    if not all(k in params for k in ["path", "old_str", "new_str"]):
-                        return "Error: path, old_str, and new_str parameters are required"
-                    path = Path(params["path"])
-                    if not path.exists():
-                        return f"Error: {path} does not exist"
-                    content = path.read_text()
-                    if params["old_str"] not in content:
-                        return "Error: old_str not found exactly as specified"
-                    new_content = content.replace(params["old_str"], params["new_str"])
-                    path.write_text(new_content)
-                    return f"Replaced content in {path}"
-                    
-                elif params["command"] == "insert":
-                    if not all(k in params for k in ["path", "insert_line", "new_str"]):
-                        return "Error: path, insert_line, and new_str parameters are required"
-                    path = Path(params["path"])
-                    if not path.exists():
-                        return f"Error: {path} does not exist"
-                    try:
-                        insert_line = int(params["insert_line"])
-                    except:
-                        return "Error: insert_line must be an integer"
-                    lines = path.read_text().splitlines()
-                    if insert_line < 0 or insert_line > len(lines):
-                        return f"Error: insert_line must be between 0 and {len(lines)}"
-                    lines.insert(insert_line, params["new_str"])
-                    path.write_text("\n".join(lines))
-                    return f"Inserted content at line {insert_line} in {path}"
-                    
-                else:
-                    return f"Error: Unknown command {params['command']}"
-                    
-            except Exception as e:
-                return f"Error: {str(e)}"
-        
-        # Add the tools to self
-        self.bash = bash.__get__(self)
-        self.str_replace_editor = str_replace_editor.__get__(self)
+        # Load all tools
+        tools = load_tools()
+        for name, tool in tools.items():
+            setattr(self, name, tool)
         
     def create_history(self, project: Optional[str] = None) -> str:
         """Create a new conversation history and return its ID"""
