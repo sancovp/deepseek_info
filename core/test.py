@@ -20,13 +20,23 @@ def main():
     # Add test function
     agent.echo = TestMethods.echo
     
-    # Test with sysAction that should trigger injection
-    print("\n=== Starting Test ===")
+    # Test both tools
+    print("\n=== Starting Tests ===")
+    
+    # First test bash
     response = agent.chat(
-        'Let me test the echo function <sysAction>echo("hello")</sysAction> and then tell me what happened.',
-        system_prompt="You are a helpful AI assistant that tests functions and reports results clearly."
+        'Please show me the contents of the current directory using the bash tool.',
+        system_prompt="You are a helpful AI assistant that uses tools to help users. Be concise but thorough."
     )
-    print("\n=== Test Complete ===")
+    print("\n=== Bash Test Complete ===")
+    
+    # Then test str_replace_editor
+    response = agent.chat(
+        'Create a new file called test.txt with the content "Hello World" using str_replace_editor.',
+        system_prompt="You are a helpful AI assistant that uses tools to help users. Be concise but thorough."
+    )
+    print("\n=== Editor Test Complete ===")
+    
     print("\nFinal Response:", response)
     
 if __name__ == "__main__":
