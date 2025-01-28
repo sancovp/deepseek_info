@@ -1,0 +1,575 @@
+# note: this diff is from a failed git push where the context was lost by the LLM afterwards
+
+diff --git a/.env b/.env
+new file mode 100644
+index 0000000..f2cbed0
+--- /dev/null
++++ b/.env
+@@ -0,0 +1,2 @@
++# Add your DeepSeek API key here
++DEEPSEEK_API_KEY=your_api_key_here
+\ No newline at end of file
+diff --git a/Dockerfile b/Dockerfile
+index a653684..dfde363 100644
+--- a/Dockerfile
++++ b/Dockerfile
+@@ -18,4 +18,7 @@ COPY . .
+ # Environment variables
+ ENV PYTHONUNBUFFERED=1
+
+-CMD ["python", "test.py"]
+\ No newline at end of file
++# Make tools directory writable
++RUN mkdir -p tools && chmod 777 tools
++
++CMD ["python", "test_api.py"]
+\ No newline at end of file
+diff --git a/core/__pycache__/agent.cpython-311.pyc b/core/__pycache__/agent.cpython-311.pyc
+index bc63651..27de080 100644
+Binary files a/core/__pycache__/agent.cpython-311.pyc and b/core/__pycache__/agent.cpython-311.pyc differ
+diff --git a/core/agent.py b/core/agent.py
+index 9e0d09c..1a8e19f 100644
+--- a/core/agent.py
++++ b/core/agent.py
+@@ -77,7 +77,7 @@ class Agent:
+
+         # Prepare messages with tool docs
+         messages = []
+-        base_prompt = f"You are a helpful AI assistant with access to system tools. {TOOL_DOCS}"
++        base_prompt = "You are a helpful AI assistant with access to system tools. You can use tools by writing <sysAction>tool_name(args)</sysAction>."
+         if system_prompt:
+             base_prompt = f"{base_prompt}\n\n{system_prompt}"
+         messages.append({"role": "system", "content": base_prompt})
+diff --git a/core/basic_test.py b/core/basic_test.py
+new file mode 100644
+index 0000000..3ce037f
+--- /dev/null
++++ b/core/basic_test.py
+@@ -0,0 +1,9 @@
++from core.agent import Agent
++import os
++from dotenv import load_dotenv
++
++load_dotenv()
++
++agent = Agent("test", os.getenv("DEEPSEEK_API_KEY"))
++message = "Hello"
++agent.chat(message)
+\ No newline at end of file
+diff --git a/core/dynamic_agent.py b/core/dynamic_agent.py
+new file mode 100644
+index 0000000..e9ea169
+--- /dev/null
++++ b/core/dynamic_agent.py
+@@ -0,0 +1,274 @@
++from typing import Optional, Dict, Any, List
++from openai import OpenAI
++import os
++from pydantic import BaseModel
++import re
++from colorama import Fore, Style, init
++from importlib import import_module, reload
++from pathlib import Path
++import sys
++import inspect
++
++init()
++
++class Message(BaseModel):
++    role: str
++    content: str
++
++class History(BaseModel):
++    messages: List[Message] = []
++    id: str
++    project: Optional[str] = None
++    profile: Optional[str] = None
++
++class DynamicAgent:
++    def __init__(
++        self,
++        name: str,
++        api_key: str,
++        model: str = "deepseek-reasoner",
++        base_url: str = "https://api.deepseek.com",
++        debug: bool = True,
++        tools_dir: str = "tools"  # Directory to scan for tools
++    ):
++        self.name = name
++        self.debug = debug
++        self.client = OpenAI(
++            api_key=api_key,
++            base_url=base_url
++        )
++        self.model = model
++        self.histories: Dict[str, History] = {}
++        self.current_history_id: Optional[str] = None
++        self.current_profile: Optional[str] = None
++        self.tools_dir = tools_dir
++        self.tool_cache = {}  # Cache for discovered tools
++        
++    def resolve_tool(self, tool_name: str) -> Optional[Any]:
++        """Dynamically resolve a tool by name"""
++        # Check cache first
++        if tool_name in self.tool_cache:
++            module_name = self.tool_cache[tool_name]['module']
++            # Reload module to get any updates
++            if module_name in sys.modules:
++                reload(sys.modules[module_name])
++            module = import_module(module_name)
++            return getattr(module, self.tool_cache[tool_name]['attr'])
++            
++        # Not in cache, scan tools directory
++        base_path = Path(__file__).parent.parent
++        tools_path = base_path / self.tools_dir
++        
++        if self.debug:
++            print(f"{Fore.YELLOW}Looking for tool {tool_name} in {tools_path}{Style.RESET_ALL}")
++            
++        # Try direct module match first
++        try:
++            module_path = f"{self.tools_dir}.{tool_name}"
++            module = import_module(module_path)
++            if hasattr(module, tool_name):
++                tool = getattr(module, tool_name)
++                self.tool_cache[tool_name] = {
++                    'module': module_path,
++                    'attr': tool_name
++                }
++                return tool
++        except ImportError:
++            pass
++            
++        # Scan all modules for the tool
++        for file in tools_path.glob('*.py'):
++            if file.stem == '__init__':
++                continue
++                
++            try:
++                # Add parent directory to Python path if needed
++                parent_dir = str(tools_path.parent)
++                if parent_dir not in sys.path:
++                    sys.path.insert(0, parent_dir)
++                    
++                module_path = f"{self.tools_dir}.{file.stem}"
++                if module_path in sys.modules:
++                    reload(sys.modules[module_path])
++                module = import_module(module_path)
++                
++                if hasattr(module, tool_name):
++                    tool = getattr(module, tool_name)
++                    self.tool_cache[tool_name] = {
++                        'module': module_path,
++                        'attr': tool_name
++                    }
++                    return tool
++                    
++                # Also check for class instances with the name
++                for attr_name, attr_value in module.__dict__.items():
++                    if (inspect.isclass(attr_value) or callable(attr_value)) and \
++                       attr_name == tool_name:
++                        self.tool_cache[tool_name] = {
++                            'module': module_path,
++                            'attr': attr_name
++                        }
++                        return attr_value
++                        
++            except Exception as e:
++                if self.debug:
++                    print(f"{Fore.RED}Error importing {file}: {str(e)}{Style.RESET_ALL}")
++                continue
++                
++        return None
++        
++    def create_history(self, project: Optional[str] = None) -> str:
++        """Create a new conversation history and return its ID"""
++        from datetime import datetime
++        history_id = f"{self.name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
++        self.histories[history_id] = History(
++            id=history_id,
++            project=project,
++            messages=[]
++        )
++        return history_id
++        
++    def inject_proxy_user_msg(self, message: str) -> str:
++        """Injects a message back to the AI as if from a user, allowing iterative tool usage."""
++        print(f"\n{Fore.CYAN}💉 Injecting message:{Style.RESET_ALL}")
++        print(f"{Fore.CYAN}{message}{Style.RESET_ALL}")
++        user_message = f"Here's the injection you requested: 💉\n{message}\n💉"
++        return self.chat(user_message)
++
++    def chat(
++        self,
++        message: str,
++        history_id: Optional[str] = None,
++        system_prompt: Optional[str] = None
++    ) -> str:
++        """Chat with the model and get both reasoning and final response"""
++        
++        # Create or get history
++        if not history_id:
++            history_id = self.create_history()
++        self.current_history_id = history_id
++        
++        # Prepare messages with tool docs
++        messages = []
++        base_prompt = (
++            "You are a helpful AI assistant with access to system tools. "
++            "You can execute tools by writing <sysAction>tool_name(args)</sysAction>. "
++            "Tools are dynamically discovered from the tools directory."
++        )
++        if system_prompt:
++            base_prompt = f"{base_prompt}\n\n{system_prompt}"
++        messages.append({"role": "system", "content": base_prompt})
++            
++        # Add history messages
++        messages.extend([
++            {"role": msg.role, "content": msg.content}
++            for msg in self.histories[history_id].messages
++        ])
++        
++        # Add new message
++        messages.append({"role": "user", "content": message})
++        
++        if self.debug:
++            print(f"\n{Fore.BLUE}Sending messages:{Style.RESET_ALL}")
++            for msg in messages:
++                print(f"{msg['role']}: {msg['content'][:100]}...")
++        
++        # Get streaming response
++        try:
++            print(f"\n{Fore.YELLOW}Sending request to DeepSeek API...{Style.RESET_ALL}")
++            response = self.client.chat.completions.create(
++                model=self.model,
++                messages=messages,
++                temperature=0.7,
++                max_tokens=2000,
++                stream=True,
++                timeout=30
++            )
++            print(f"{Fore.GREEN}Got response from API{Style.RESET_ALL}")
++        except Exception as e:
++            print(f"{Fore.RED}Error calling DeepSeek API: {str(e)}{Style.RESET_ALL}")
++            raise
++        
++        # Collect reasoning and content
++        reasoning_content = ""
++        content = ""
++        
++        print(f"\n{Fore.CYAN}🤔 Reasoning:{Style.RESET_ALL}")
++        for chunk in response:
++            if hasattr(chunk.choices[0].delta, 'reasoning_content'):
++                if chunk.choices[0].delta.reasoning_content:
++                    reasoning = chunk.choices[0].delta.reasoning_content
++                    reasoning_content += reasoning
++                    print(reasoning, end='', flush=True)
++            else:
++                if hasattr(chunk.choices[0].delta, 'content'):
++                    if chunk.choices[0].delta.content:
++                        content_chunk = chunk.choices[0].delta.content
++                        content += content_chunk
++                        
++        print(f"\n{Fore.GREEN}💭 Response:{Style.RESET_ALL}\n{content}")
++        
++        # Process the content for system actions as we receive it
++        current_content = ""
++        for line in content.split('\n'):
++            if '<sysAction>' in line:
++                # Process any system actions in this line
++                processed_line = self.process_system_actions(line)
++                current_content += processed_line + '\n' if processed_line else '\n'
++            else:
++                current_content += line + '\n'
++        
++        # Update history
++        self.histories[history_id].messages.append(Message(role="user", content=message))
++        self.histories[history_id].messages.append(Message(role="assistant", content=current_content))
++        
++        return current_content
++    
++    def process_system_actions(self, text: str) -> str:
++        """Process any system actions in the text using regex"""
++        def replace_action(match):
++            func_name = match.group(1)
++            func_args = match.group(2)
++            
++            # Try to resolve the tool
++            tool = self.resolve_tool(func_name)
++            if tool:
++                try:
++                    # Clean up the args string (remove quotes if present)
++                    clean_args = func_args.strip('"\'')
++                    result = tool(clean_args)
++                    # Format result for injection
++                    if isinstance(result, str) and result.startswith("Error"):
++                        action_result = f"🚨<sysActionError>\n{func_name}({func_args})\n\n[RESULT]:\n\n{result}\n</sysActionError>🚨"
++                    else:
++                        action_result = f"<sysActionResults>\n{func_name}({func_args})\n\n[RESULT]:\n\n{result}\n</sysActionResults>"
++                    
++                    # Print debug info
++                    print(f"\n{Fore.YELLOW}Executing sysAction: {func_name}({clean_args}){Style.RESET_ALL}")
++                    print(f"{Fore.GREEN}Result: {result}{Style.RESET_ALL}")
++                    
++                    # Inject result back to AI and return empty string to hide original output
++                    self.inject_proxy_user_msg(action_result)
++                    return ""
++                except Exception as e:
++                    error_result = f"🚨<sysActionError>\n{func_name}({func_args})\n\n[ERROR]:\n\n{str(e)}\n</sysActionError>🚨"
++                    self.inject_proxy_user_msg(error_result)
++                    return ""
++                    
++            # List available tools in error message
++            tools = list(self.tool_cache.keys())
++            unknown_result = (
++                f"🚨<sysActionError>\n"
++                f"Could not find tool: {func_name}\n"
++                f"Available tools: {tools}\n"
++                "</sysActionError>🚨"
++            )
++            self.inject_proxy_user_msg(unknown_result)
++            return ""
++            
++        return re.sub(
++            r'<sysAction>\s*(\w+)\s*\((.*?)\)\s*</sysAction>',
++            replace_action,
++            text,
++            flags=re.DOTALL
++        )
+\ No newline at end of file
+diff --git a/core/test.py b/core/test.py
+index e010e6b..59fa0ca 100644
+--- a/core/test.py
++++ b/core/test.py
+@@ -1,4 +1,4 @@
+-from agent import Agent
++from core.agent import Agent
+ import os
+ from dotenv import load_dotenv
+
+diff --git a/core/tools/__pycache__/__init__.cpython-311.pyc b/core/tools/__pycache__/__init__.cpython-311.pyc
+new file mode 100644
+index 0000000..c7ecfc8
+Binary files /dev/null and b/core/tools/__pycache__/__init__.cpython-311.pyc differ
+diff --git a/core/tools/__pycache__/base.cpython-311.pyc b/core/tools/__pycache__/base.cpython-311.pyc
+new file mode 100644
+index 0000000..4d214d3
+Binary files /dev/null and b/core/tools/__pycache__/base.cpython-311.pyc differ
+diff --git a/core/tools/__pycache__/bash.cpython-311.pyc b/core/tools/__pycache__/bash.cpython-311.pyc
+new file mode 100644
+index 0000000..6f3f77f
+Binary files /dev/null and b/core/tools/__pycache__/bash.cpython-311.pyc differ
+diff --git a/core/tools/__pycache__/editor.cpython-311.pyc b/core/tools/__pycache__/editor.cpython-311.pyc
+new file mode 100644
+index 0000000..cfb4bc3
+Binary files /dev/null and b/core/tools/__pycache__/editor.cpython-311.pyc differ
+diff --git a/core/tools/__pycache__/tool_info.cpython-311.pyc b/core/tools/__pycache__/tool_info.cpython-311.pyc
+new file mode 100644
+index 0000000..40d0304
+Binary files /dev/null and b/core/tools/__pycache__/tool_info.cpython-311.pyc differ
+diff --git a/requirements.txt b/requirements.txt
+new file mode 100644
+index 0000000..afed4f0
+--- /dev/null
++++ b/requirements.txt
+@@ -0,0 +1,4 @@
++openai>=1.0.0
++pydantic>=2.0.0
++python-dotenv
++colorama
+\ No newline at end of file
+diff --git a/test_agent.py b/test_agent.py
+new file mode 100644
+index 0000000..5efbeb1
+--- /dev/null
++++ b/test_agent.py
+@@ -0,0 +1,19 @@
++from core.agent import Agent
++import os
++from dotenv import load_dotenv
++
++load_dotenv()  # Load environment variables from .env file
++
++def main():
++    agent = Agent(
++        name="test_agent",
++        api_key=os.environ["DEEPSEEK_API_KEY"],
++        debug=True
++    )
++    
++    # Test a simple sysAction
++    response = agent.chat("Write <sysAction>bash('echo hello')</sysAction> to test bash execution")
++    print("\nResponse:", response)
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_api.py b/test_api.py
+new file mode 100644
+index 0000000..119b75e
+--- /dev/null
++++ b/test_api.py
+@@ -0,0 +1,19 @@
++from openai import OpenAI
++import os
++
++def main():
++    client = OpenAI(
++        api_key=os.environ["DEEPSEEK_API_KEY"],
++        base_url="https://api.deepseek.com"
++    )
++    
++    print("Testing API connection...")
++    response = client.chat.completions.create(
++        model="deepseek-chat",
++        messages=[{"role": "user", "content": "Say hello"}],
++        stream=False
++    )
++    print("\nResponse:", response.choices[0].message.content)
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_dynamic.py b/test_dynamic.py
+new file mode 100644
+index 0000000..e3f0a00
+--- /dev/null
++++ b/test_dynamic.py
+@@ -0,0 +1,43 @@
++from core.dynamic_agent import DynamicAgent
++import os
++from dotenv import load_dotenv
++
++load_dotenv()
++
++def main():
++    # Initialize agent
++    agent = DynamicAgent(
++        name="test_agent",
++        api_key=os.getenv("DEEPSEEK_API_KEY"),
++        debug=True
++    )
++    
++    # Create a new test tool dynamically
++    with open("tools/test_tool.py", "w") as f:
++        f.write("""
++def test_function(args):
++    \"\"\"A test function that echoes its args\"\"\"
++    return f"Test function received: {args}"
++""")
++    
++    # Try using the tool
++    print("\nTesting dynamic tool loading...")
++    response = agent.chat("Can you call the test_function with argument 'hello'?")
++    print("\nResponse:", response)
++    
++    # Create another tool dynamically
++    print("\nCreating another tool...")
++    with open("tools/another_tool.py", "w") as f:
++        f.write("""
++def another_function(args):
++    \"\"\"Another test function\"\"\"
++    return f"Another function got: {args}"
++""")
++    
++    # Try using both tools
++    print("\nTesting both tools...")
++    response = agent.chat("Please call test_function with 'first' and another_function with 'second'")
++    print("\nResponse:", response)
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/test_dynamic_noapi.py b/test_dynamic_noapi.py
+new file mode 100644
+index 0000000..901e129
+--- /dev/null
++++ b/test_dynamic_noapi.py
+@@ -0,0 +1,50 @@
++from core.dynamic_agent import DynamicAgent
++import os
++
++def test_tool_resolution():
++    # Initialize agent without API key
++    agent = DynamicAgent(
++        name="test_agent",
++        api_key="fake_key",
++        debug=True
++    )
++    
++    print("Creating test tool...")
++    with open("tools/test_tool.py", "w") as f:
++        f.write("""
++def test_function(args):
++    \"\"\"A test function that echoes its args\"\"\"
++    return f"Test function received: {args}"
++""")
++    
++    print("\nTrying to resolve test_function...")
++    tool = agent.resolve_tool("test_function")
++    if tool:
++        print("Successfully resolved test_function")
++        result = tool("test args")
++        print(f"Test result: {result}")
++    else:
++        print("Failed to resolve test_function")
++    
++    print("\nCreating another tool...")
++    with open("tools/another_tool.py", "w") as f:
++        f.write("""
++def another_function(args):
++    \"\"\"Another test function\"\"\"
++    return f"Another function got: {args}"
++""")
++    
++    print("\nTrying to resolve another_function...")
++    tool = agent.resolve_tool("another_function")
++    if tool:
++        print("Successfully resolved another_function")
++        result = tool("more test args")
++        print(f"Test result: {result}")
++    else:
++        print("Failed to resolve another_function")
++        
++    print("\nListing cached tools:")
++    print(list(agent.tool_cache.keys()))
++
++if __name__ == "__main__":
++    test_tool_resolution()
+\ No newline at end of file
+diff --git a/test_sysaction.py b/test_sysaction.py
+new file mode 100644
+index 0000000..fb24caf
+--- /dev/null
++++ b/test_sysaction.py
+@@ -0,0 +1,26 @@
++from core.dynamic_agent import DynamicAgent
++import os
++
++def main():
++    # Initialize agent with API key from environment
++    agent = DynamicAgent(
++        name="test_agent",
++        api_key=os.environ["DEEPSEEK_API_KEY"],
++        debug=True
++    )
++    
++    print("Creating test tool...")
++    with open("tools/echo_tool.py", "w") as f:
++        f.write("""
++def echo(args):
++    \"\"\"Simple echo function\"\"\"
++    return f"Echo received: {args}"
++""")
++
++    # Test sysAction with the new tool
++    print("\nTesting sysAction with echo tool...")
++    response = agent.chat("Please use the echo tool with the message 'hello world'")
++    print("\nFull response:", response)
++
++if __name__ == "__main__":
++    main()
+\ No newline at end of file
+diff --git a/tools/__init__.py b/tools/__init__.py
+new file mode 100644
+index 0000000..e69de29
